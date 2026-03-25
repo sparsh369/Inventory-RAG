@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct
 from openai import OpenAI
@@ -12,24 +11,17 @@ st.set_page_config(page_title="Inventory SQL + RAG", layout="wide")
 
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# ✅ Cache model
-@st.cache_resource
-def load_model():
-    return SentenceTransformer("all-MiniLM-L6-v2")
-
-embed_model = load_model()
-
-# Qdrant setup
+# ---------------- QDRANT ----------------
 qdrant = QdrantClient(":memory:")
 COLLECTION_NAME = "inventory"
 
 if COLLECTION_NAME not in [c.name for c in qdrant.get_collections().collections]:
     qdrant.create_collection(
         collection_name=COLLECTION_NAME,
-        vectors_config=VectorParams(size=384, distance=Distance.COSINE)
+        vectors_config=VectorParams(size=1536, distance=Distance.COSINE)  # ✅ OpenAI embedding size
     )
 
-# SQLite
+# ---------------- SQLITE ----------------
 conn = sqlite3.connect("inventory.db", check_same_thread=False)
 
 # ---------------- FUNCTIONS ----------------
@@ -44,7 +36,16 @@ def store_sql(df):
     df.to_sql("inventory", conn, if_exists="replace", index=False)
 
 
-# ✅ FIXED FAST VERSION (WITH PROGRESS BAR)
+# ✅ OpenAI embedding function
+def get_embeddings(texts):
+    response = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=texts
+    )
+    return [item.embedding for item in response.data]
+
+
+# ✅ LIGHT + FAST
 def store_qdrant(df):
     texts = []
     payloads = []
@@ -54,15 +55,15 @@ def store_qdrant(df):
         texts.append(text)
         payloads.append(row.to_dict())
 
-    batch_size = 32
-    all_vectors = []
-
     progress = st.progress(0)
+
+    # ⚡ Process in chunks (avoid API overload)
+    batch_size = 50
+    all_vectors = []
 
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i+batch_size]
-
-        vectors = embed_model.encode(batch)
+        vectors = get_embeddings(batch)
         all_vectors.extend(vectors)
 
         progress.progress(min((i + batch_size) / len(texts), 1.0))
@@ -71,14 +72,13 @@ def store_qdrant(df):
     for i in range(len(all_vectors)):
         points.append(PointStruct(
             id=str(uuid.uuid4()),
-            vector=all_vectors[i].tolist(),
+            vector=all_vectors[i],
             payload=payloads[i]
         ))
 
     qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
 
 
-# ❌ REMOVED CACHE (IMPORTANT FIX)
 def process_data(df):
     store_sql(df)
     store_qdrant(df)
@@ -138,7 +138,7 @@ def run_sql(query):
 
 
 def rag_search(query):
-    vector = embed_model.encode(query).tolist()
+    vector = get_embeddings([query])[0]
 
     hits = qdrant.search(
         collection_name=COLLECTION_NAME,
