@@ -12,7 +12,7 @@ st.set_page_config(page_title="Inventory SQL + RAG", layout="wide")
 
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# ✅ Cache model (VERY IMPORTANT)
+# ✅ Cache model
 @st.cache_resource
 def load_model():
     return SentenceTransformer("all-MiniLM-L6-v2")
@@ -36,10 +36,7 @@ conn = sqlite3.connect("inventory.db", check_same_thread=False)
 
 def load_data(file):
     df = pd.read_excel(file)
-
-    # ✅ Clean column names (CRITICAL)
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
-
     return df
 
 
@@ -47,7 +44,7 @@ def store_sql(df):
     df.to_sql("inventory", conn, if_exists="replace", index=False)
 
 
-# ✅ FAST BATCH EMBEDDING
+# ✅ FIXED FAST VERSION (WITH PROGRESS BAR)
 def store_qdrant(df):
     texts = []
     payloads = []
@@ -57,22 +54,31 @@ def store_qdrant(df):
         texts.append(text)
         payloads.append(row.to_dict())
 
-    # ⚡ batch encoding
-    vectors = embed_model.encode(texts, batch_size=64, show_progress_bar=True)
+    batch_size = 32
+    all_vectors = []
+
+    progress = st.progress(0)
+
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+
+        vectors = embed_model.encode(batch)
+        all_vectors.extend(vectors)
+
+        progress.progress(min((i + batch_size) / len(texts), 1.0))
 
     points = []
-    for i in range(len(vectors)):
+    for i in range(len(all_vectors)):
         points.append(PointStruct(
             id=str(uuid.uuid4()),
-            vector=vectors[i].tolist(),
+            vector=all_vectors[i].tolist(),
             payload=payloads[i]
         ))
 
     qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
 
 
-# ✅ Cache processing (NO REPEAT WORK)
-@st.cache_data
+# ❌ REMOVED CACHE (IMPORTANT FIX)
 def process_data(df):
     store_sql(df)
     store_qdrant(df)
@@ -97,7 +103,6 @@ def classify_query(query):
     return res.choices[0].message.content.strip()
 
 
-# ✅ FIXED SQL GENERATOR (WITH SCHEMA)
 def generate_sql(query, columns):
     prompt = f"""
     You are a SQL expert.
@@ -124,7 +129,6 @@ def generate_sql(query, columns):
     return res.choices[0].message.content.strip()
 
 
-# ✅ SAFE SQL EXECUTION
 def run_sql(query):
     try:
         df = pd.read_sql(query, conn)
@@ -175,10 +179,10 @@ if file:
     st.dataframe(df.head())
 
     if st.button("Process Data"):
-        with st.spinner("Processing..."):
+        with st.spinner("Processing data... ⏳"):
             process_data(df)
             st.session_state["processed"] = True
-        st.success("Data processed successfully!")
+        st.success("✅ Data processed successfully!")
 
 # ---------------- QUERY ----------------
 
@@ -186,7 +190,6 @@ st.subheader("Ask Questions")
 
 query = st.text_input("Enter your question")
 
-# ✅ Prevent query before processing
 if "processed" not in st.session_state:
     st.warning("Please click 'Process Data' first")
     st.stop()
