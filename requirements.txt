@@ -1,0 +1,6 @@
+streamlit
+pandas
+openai
+sentence-transformers
+qdrant-client
+openpyxl
