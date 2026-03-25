@@ -10,13 +10,16 @@ import uuid
 # ---------------- CONFIG ----------------
 st.set_page_config(page_title="Inventory SQL + RAG", layout="wide")
 
-# Load OpenAI key from Streamlit secrets
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# Embedding model
-embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+# ✅ Cache model (VERY IMPORTANT)
+@st.cache_resource
+def load_model():
+    return SentenceTransformer("all-MiniLM-L6-v2")
 
-# Qdrant setup (in-memory for simplicity)
+embed_model = load_model()
+
+# Qdrant setup
 qdrant = QdrantClient(":memory:")
 COLLECTION_NAME = "inventory"
 
@@ -26,14 +29,17 @@ if COLLECTION_NAME not in [c.name for c in qdrant.get_collections().collections]
         vectors_config=VectorParams(size=384, distance=Distance.COSINE)
     )
 
-# SQLite setup
+# SQLite
 conn = sqlite3.connect("inventory.db", check_same_thread=False)
 
 # ---------------- FUNCTIONS ----------------
 
 def load_data(file):
     df = pd.read_excel(file)
-    df.columns = [c.strip().lower() for c in df.columns]
+
+    # ✅ Clean column names (CRITICAL)
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+
     return df
 
 
@@ -41,30 +47,45 @@ def store_sql(df):
     df.to_sql("inventory", conn, if_exists="replace", index=False)
 
 
+# ✅ FAST BATCH EMBEDDING
 def store_qdrant(df):
-    points = []
-    for i, row in df.iterrows():
-        text = " ".join([f"{col} {row[col]}" for col in df.columns])
-        vector = embed_model.encode(text).tolist()
-        payload = row.to_dict()
+    texts = []
+    payloads = []
 
+    for _, row in df.iterrows():
+        text = " ".join([f"{col} {row[col]}" for col in df.columns])
+        texts.append(text)
+        payloads.append(row.to_dict())
+
+    # ⚡ batch encoding
+    vectors = embed_model.encode(texts, batch_size=64, show_progress_bar=True)
+
+    points = []
+    for i in range(len(vectors)):
         points.append(PointStruct(
             id=str(uuid.uuid4()),
-            vector=vector,
-            payload=payload
+            vector=vectors[i].tolist(),
+            payload=payloads[i]
         ))
 
     qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
 
 
+# ✅ Cache processing (NO REPEAT WORK)
+@st.cache_data
+def process_data(df):
+    store_sql(df)
+    store_qdrant(df)
+
+
 def classify_query(query):
     prompt = f"""
-    Classify the query into one of two types:
-    1. SQL (structured, aggregation, filtering)
-    2. RAG (semantic/general)
+    Classify query as SQL or RAG.
+
+    SQL = numbers, filters, aggregation
+    RAG = explanation, meaning
 
     Query: {query}
-
     Answer only SQL or RAG.
     """
 
@@ -76,13 +97,23 @@ def classify_query(query):
     return res.choices[0].message.content.strip()
 
 
-def generate_sql(query):
+# ✅ FIXED SQL GENERATOR (WITH SCHEMA)
+def generate_sql(query, columns):
     prompt = f"""
-    Convert this question into SQL query.
-    Table name: inventory
+    You are a SQL expert.
+
+    Table: inventory
+    Columns: {columns}
+
+    Rules:
+    - Use ONLY these columns
+    - Do NOT invent columns
+    - Replace 'stock' with 'shelf_stock'
+    - Do NOT use 'threshold'
 
     Question: {query}
-    Only return SQL.
+
+    Return ONLY SQL.
     """
 
     res = client.chat.completions.create(
@@ -93,12 +124,13 @@ def generate_sql(query):
     return res.choices[0].message.content.strip()
 
 
+# ✅ SAFE SQL EXECUTION
 def run_sql(query):
     try:
-        result = pd.read_sql(query, conn)
-        return result
+        df = pd.read_sql(query, conn)
+        return df, None
     except Exception as e:
-        return str(e)
+        return None, str(e)
 
 
 def rag_search(query):
@@ -129,6 +161,7 @@ def rag_search(query):
 
     return res.choices[0].message.content
 
+
 # ---------------- UI ----------------
 
 st.title("📦 Inventory SQL + RAG Dashboard")
@@ -137,17 +170,26 @@ file = st.file_uploader("Upload Inventory Excel", type=["xlsx"])
 
 if file:
     df = load_data(file)
+
     st.subheader("Preview")
     st.dataframe(df.head())
 
     if st.button("Process Data"):
-        store_sql(df)
-        store_qdrant(df)
-        st.success("Data stored in SQL + Vector DB")
+        with st.spinner("Processing..."):
+            process_data(df)
+            st.session_state["processed"] = True
+        st.success("Data processed successfully!")
 
-# Query section
+# ---------------- QUERY ----------------
+
 st.subheader("Ask Questions")
+
 query = st.text_input("Enter your question")
+
+# ✅ Prevent query before processing
+if "processed" not in st.session_state:
+    st.warning("Please click 'Process Data' first")
+    st.stop()
 
 if st.button("Run Query") and query:
     qtype = classify_query(query)
@@ -155,22 +197,27 @@ if st.button("Run Query") and query:
     st.write(f"Detected Type: {qtype}")
 
     if "SQL" in qtype:
-        sql_query = generate_sql(query)
+        sql_query = generate_sql(query, df.columns.tolist())
         st.code(sql_query, language="sql")
 
-        result = run_sql(sql_query)
-        st.dataframe(result)
+        result, error = run_sql(sql_query)
+
+        if error:
+            st.error(error)
+        else:
+            st.dataframe(result)
 
     else:
         answer = rag_search(query)
         st.write(answer)
 
-# Sidebar tips
+# ---------------- SIDEBAR ----------------
+
 st.sidebar.title("Tips")
 st.sidebar.write("""
-Try questions like:
-- Which items are low in stock?
-- Show all items in warehouse A
-- What is total quantity?
-- Tell me about item X
+Try:
+- items where shelf_stock < safety_stock
+- top 10 items by demand
+- show items in plant 2001
+- tell me about material X
 """)
